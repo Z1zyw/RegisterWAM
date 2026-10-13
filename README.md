@@ -2,9 +2,7 @@
 
 Official code for **RegisterWAM**.
 
-RegisterWAM connects video and action branches through learned register
-tokens, built on Wan2.2-TI2V-5B and FastWAM. This repository provides
-training and evaluation on LIBERO-plus.
+Training and evaluation on LIBERO-plus.
 
 ## News
 
@@ -13,14 +11,27 @@ training and evaluation on LIBERO-plus.
 
 ## Installation
 
-Use Python 3.10 and install a CUDA-compatible PyTorch build, then:
+Python 3.10 and a CUDA-capable NVIDIA GPU are required. The commands below
+install PyTorch with CUDA 12.8; use a compatible NVIDIA driver.
 
 ```bash
+conda create -n register-wam python=3.10 -y
+conda activate register-wam
+git clone https://github.com/Z1zyw/RegisterWAM.git
+cd RegisterWAM
+pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+pip install "numpy==1.26.4" "transformers==4.49.0" "datasets==3.6.0"
 pip install -e ".[eval]"
 ```
 
-Install LIBERO-plus and its simulation assets in the same environment.
-Pass its checkout path with `--libero-root`.
+### LIBERO-plus
+
+Set up [LIBERO-plus](https://github.com/sylvestf/LIBERO-plus) and its
+simulation assets following the official
+[installation guide](https://github.com/sylvestf/LIBERO-plus#installation).
+Use the same Python environment and pass its checkout path with `--libero-root`.
+Do not overwrite this environment with the legacy dependency versions in
+LIBERO-plus's `requirements.txt`.
 
 ## Model and Data Preparation
 
@@ -39,22 +50,15 @@ assets/
 
 The dataset directory contains the `libero_10`, `libero_goal`, `libero_object`,
 and `libero_spatial` datasets with the `_no_noops_lerobot` suffix.
+`--asset-root` points to the directory containing `checkpoints/` and `data/`.
+Keep the complete Wan2.2 checkpoint directory, including the VAE, text encoder,
+and tokenizer required for evaluation.
 
 ## LIBERO-plus Configuration
 
 - Model: [configs/model/register_wam_libero.yaml](configs/model/register_wam_libero.yaml).
 - Data: [configs/data/libero_plus.yaml](configs/data/libero_plus.yaml).
 - Training: [configs/task/libero_plus.yaml](configs/task/libero_plus.yaml).
-
-Defaults: 8 registers, independent 5B video and 1B action experts, batched VAE,
-32-step actions, two 224x224 cameras, batch size 16 per GPU, 10 epochs,
-learning rate 1e-4, and 5% warmup. Loss coefficients are action 0.2, video 1,
-and noised-observation auxiliary 2; pure-noise video loss has weight 2.
-`visual_attention_mode: bidirectional` lets observation, register, and future
-tokens attend to each other. The noised-observation auxiliary stream is
-isolated. Action tokens attend only to registers and other action tokens.
-Both experts, registers, and the proprioception encoder use the same learning
-rate; the VAE and text encoder remain frozen.
 
 ## Training and Evaluation
 
@@ -65,17 +69,18 @@ all LIBERO-plus tasks, using three persistent workers per GPU:
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python scripts/train_eval_libero_plus.py --mode train_eval --asset-root /path/to/assets --libero-root /path/to/LIBERO-plus --gpus 0,1,2,3,4,5,6,7 --max-tasks-per-gpu 3 --task-fraction 1 --num-trials 1 --output-dir runs/libero_plus
 ```
 
-Use `--mode train` for training only. To evaluate a trained checkpoint:
+Use `--mode train` for training only. To evaluate the latest checkpoint:
 
 ```bash
-MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python scripts/train_eval_libero_plus.py --mode eval --asset-root /path/to/assets --libero-root /path/to/LIBERO-plus --gpus 0,1,2,3,4,5,6,7 --task-fraction 1 --output-dir runs/libero_plus --ckpt runs/libero_plus/checkpoints/weights/step_021700.pt
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python scripts/train_eval_libero_plus.py --mode eval --asset-root /path/to/assets --libero-root /path/to/LIBERO-plus --gpus 0,1,2,3,4,5,6,7 --task-fraction 1 --output-dir runs/libero_plus
 ```
 
-Evaluation uses the run's saved configuration and normalization statistics.
-Defaults are 10 inference steps and `--replan-steps 10`. Results are saved in
+For evaluation, `--output-dir` must contain the training run's `config.yaml`,
+`dataset_stats.json`, and checkpoints. Use `--ckpt /path/to/step_XXXXXX.pt`
+to select a specific checkpoint. Results are saved in
 `runs/libero_plus/eval_libero_plus/<timestamp>/`. Set `--task-fraction 0.2`
-for a stratified subset; `--subset-seed` defaults to 42. Hydra training
-overrides such as `num_epochs=8` can be appended to the training command.
+for a stratified subset. Append Hydra overrides to the training command,
+for example `num_epochs=8`.
 
 ## Acknowledgements
 
