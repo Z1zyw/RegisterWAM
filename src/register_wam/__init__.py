@@ -1,0 +1,1 @@
+"""RegisterWAM reference implementation."""

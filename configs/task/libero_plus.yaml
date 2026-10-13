@@ -1,0 +1,13 @@
+# @package _global_
+batch_size: 16
+num_workers: 12
+prefetch_factor: 3
+num_epochs: 10
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+save_every: 2000
+eval_every: 0
+checkpoint_keep_last_weights: 3
+checkpoint_state_final_only: true
+data:
+  val: null

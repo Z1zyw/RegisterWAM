@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, DefaultDict, Dict, List, Optional
+
+import numpy as np
+import torch
+import traceback
+
+from .base_lerobot_dataset import MAX_GETITEM_ATTEMPT, logger, sliding_window_with_replication
+from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
+from .processors.base_processor import BaseProcessor
+
+
+class BaseLerobotDatasetHistoryFast(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        dataset_dirs: List[str],
+        shape_meta: Dict[str, Any],
+        action_size: int = 1,
+        past_action_size: int = 0,
+        obs_size: int = 1,
+        past_obs_size: int = 0,
+        val_set_proportion: float = 0.05,
+        is_training_set: bool = False,
+        seed: int = 42,
+        global_sample_stride: int = 1,
+        log_retry_traceback: bool = False,
+    ):
+        if len(dataset_dirs) == 0:
+            raise ValueError('At least one dataset directory is required')
+        if past_action_size != 0:
+            raise ValueError(f'`past_action_size` is unsupported, got {past_action_size}')
+        if action_size != obs_size - 1:
+            raise ValueError(
+                f'In this dataset, `action_size` should be `obs_size - 1`, got action_size={action_size}, obs_size={obs_size}'
+            )
+
+        self.dataset_dirs = dataset_dirs
+        self.shape_meta = shape_meta
+        self.action_size = int(action_size)
+        self.past_action_size = int(past_action_size)
+        self.obs_size = int(obs_size)
+        self.past_obs_size = int(past_obs_size)
+        self.processor = None
+        self.log_retry_traceback = bool(log_retry_traceback)
+
+        metas = []
+        for ds_dir in dataset_dirs:
+            ds_root = Path(ds_dir)
+            metas.append(LeRobotDatasetMetadata(repo_id=ds_dir, root=ds_root))
+
+        fps_list = [m.fps for m in metas]
+        if len(set(fps_list)) != 1:
+            raise ValueError(f'All dataset_dirs must have the same fps, got {fps_list}')
+        fps = fps_list[0]
+
+        self.global_sample_stride = int(global_sample_stride)
+        self.val_set_proportion = float(val_set_proportion)
+        self.is_training_set = bool(is_training_set)
+
+        self.image_meta = shape_meta['images']
+        self.state_meta = shape_meta['state']
+        self.action_meta = shape_meta['action']
+
+        delta_timestamps = {}
+        obs_timestamp_range = range(-self.past_obs_size, -self.past_obs_size + self.obs_size)
+
+        for meta in self.image_meta:
+            key = meta['key']
+            meta['lerobot_key'] = f'observation.images.{key}' if key != 'default' else 'observation.images'
+            delta_timestamps[meta['lerobot_key']] = [
+                (t * self.global_sample_stride) / fps for t in obs_timestamp_range
+            ]
+
+        for meta in self.state_meta:
+            key = meta['key']
+            meta['lerobot_key'] = f'observation.state.{key}' if key != 'default' else 'observation.state'
+            delta_timestamps[meta['lerobot_key']] = [
+                (t * self.global_sample_stride) / fps for t in obs_timestamp_range
+            ]
+
+        for meta in self.action_meta:
+            key = meta['key']
+            meta['lerobot_key'] = f'action.{key}' if key != 'default' else 'action'
+            delta_timestamps[meta['lerobot_key']] = [
+                (t * self.global_sample_stride) / fps
+                for t in range(-self.past_action_size, -self.past_action_size + self.action_size)
+            ]
+
+        episodes = {}
+        if val_set_proportion < 1e-6:
+            for meta in metas:
+                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
+        else:
+            rng = np.random.default_rng(seed)
+            for meta in metas:
+                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
+                episode_indices = list(range(meta.total_episodes))
+                rng.shuffle(episode_indices)
+                if self.is_training_set:
+                    selected = [episode_indices[i] for i in range(split_idx)]
+                else:
+                    selected = [episode_indices[i] for i in range(split_idx, meta.total_episodes)]
+                episodes.update({meta.repo_id: selected})
+
+        self.multi_dataset = MultiLeRobotDataset(
+            dataset_dirs=self.dataset_dirs,
+            episodes=episodes,
+            delta_timestamps=delta_timestamps,
+        )
+
+        episode_data_index = []
+        end_index = 0
+        for dataset in self.multi_dataset._datasets:
+            multi_episode_data_index = {
+                'from': dataset.episode_data_index['from'] + end_index,
+                'to': dataset.episode_data_index['to'] + end_index,
+            }
+            episode_data_index.append(multi_episode_data_index)
+            end_index = multi_episode_data_index['to'][-1]
+
+        self.episode_data_index = {
+            'from': torch.cat([dataset['from'] for dataset in episode_data_index]),
+            'to': torch.cat([dataset['to'] for dataset in episode_data_index]),
+        }
+
+    def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
+        key, lerobot_key, raw_shape = meta['key'], meta['lerobot_key'], meta['raw_shape']
+        action: torch.Tensor = lerobot_sample[lerobot_key]
+        if action.ndim == 1:
+            action = action.unsqueeze(-1)
+        if action.shape[-1] != raw_shape:
+            raise ValueError(f"Action '{key}' shape {action.shape[-1]} mismatch with meta {raw_shape}.")
+        return action
+
+    def _get_state(self, meta, lerobot_sample) -> torch.Tensor:
+        key, lerobot_key, raw_shape = meta['key'], meta['lerobot_key'], meta['raw_shape']
+        state: torch.Tensor = lerobot_sample[lerobot_key]
+        if state.ndim == 1:
+            state = state.unsqueeze(-1)
+        if state.shape[-1] != raw_shape:
+            raise ValueError(f"State '{key}' shape {state.shape[-1]} mismatch with meta {raw_shape}.")
+        return state
+
+    def _get_image(self, meta, lerobot_sample) -> torch.Tensor:
+        image: torch.Tensor = lerobot_sample[meta['lerobot_key']]
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        return (image * 255).to(torch.uint8)
+
+    def _split_lerobot_sample(self, lerobot_sample) -> Dict[str, Any]:
+        return lerobot_sample
+
+    def _get_episode_data(self, episode_idx):
+        lerobot_sample = self.multi_dataset.get_episode_data(episode_idx)
+        lerobot_sample = self._split_lerobot_sample(lerobot_sample)
+        state, action = {}, {}
+        for meta in self.state_meta:
+            state[meta['key']] = self._get_state(meta, lerobot_sample).unsqueeze(1).float()
+        for meta in self.action_meta:
+            a = self._get_action(meta, lerobot_sample)
+            action[meta['key']] = sliding_window_with_replication(a, self.action_size).float()
+        return {'action': action, 'state': state}
+
+    def _get_additional_data(self, sample, lerobot_sample):
+        return sample
+
+    def _set_return_images(self, flag: bool):
+        self.return_images = flag
+        self.multi_dataset.set_during_training(flag)
+
+    def __len__(self):
+        return self.multi_dataset.num_frames
+
+    def __getitem__(self, idx):
+        if idx >= len(self):
+            raise IndexError(f'Index {idx} out of bounds {len(self)}.')
+
+        sample_idx = idx
+        attempt = 0
+        last_exception: Optional[Exception] = None
+        while attempt < MAX_GETITEM_ATTEMPT:
+            try:
+                lerobot_sample = self.multi_dataset[sample_idx]
+                lerobot_sample = self._split_lerobot_sample(lerobot_sample)
+                break
+            except Exception as err:
+                attempt += 1
+                last_exception = err
+                logger.warning(
+                    'Error loading sample %s (attempt %s/%s). Retrying with a random index. Error: %s',
+                    sample_idx,
+                    attempt,
+                    MAX_GETITEM_ATTEMPT,
+                    err,
+                )
+                if self.log_retry_traceback:
+                    logger.exception('Detailed dataset retry traceback')
+                sample_idx = int(np.random.randint(len(self)))
+        else:
+            raise RuntimeError(
+                f'Failed to load a valid sample after {MAX_GETITEM_ATTEMPT} attempts for index {idx}.'
+            ) from last_exception
+
+        sample = {
+            'idx': sample_idx,
+            'task': lerobot_sample['task'],
+            'action': {},
+            'state': {},
+            'images': {},
+        }
+        for meta in self.state_meta:
+            sample['state'][meta['key']] = self._get_state(meta, lerobot_sample)
+        for meta in self.action_meta:
+            sample['action'][meta['key']] = self._get_action(meta, lerobot_sample)
+        for meta in self.image_meta:
+            sample['images'][meta['key']] = self._get_image(meta, lerobot_sample)
+
+        sample['action_is_pad'] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
+        sample['state_is_pad'] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
+        sample['image_is_pad'] = lerobot_sample[f"{self.image_meta[0]['lerobot_key']}_is_pad"]
+        sample = self._get_additional_data(sample, lerobot_sample)
+
+        for key in lerobot_sample:
+            if key not in sample and 'observation' not in key and 'action' not in key:
+                sample[key] = lerobot_sample[key]
+
+        if self.processor is not None:
+            sample = self.processor.preprocess(sample)
+        return sample
+
+    def set_processor(self, processor: BaseProcessor):
+        self.processor = processor
+        if self.is_training_set:
+            self.processor.train()
+        else:
+            self.processor.eval()
+        return self
+
+    def get_dataset_stats(self, preprocessor: BaseProcessor):
+        state_min = DefaultDict(list)
+        state_max = DefaultDict(list)
+        state_mean = DefaultDict(list)
+        state_var = DefaultDict(list)
+        state_q01 = DefaultDict(list)
+        state_q99 = DefaultDict(list)
+
+        action_min = DefaultDict(list)
+        action_max = DefaultDict(list)
+        action_mean = DefaultDict(list)
+        action_var = DefaultDict(list)
+        action_q01 = DefaultDict(list)
+        action_q99 = DefaultDict(list)
+
+        episodes_num = self.multi_dataset.num_episodes
+
+        def process_episode(episode_idx):
+            batch = self._get_episode_data(episode_idx)
+            batch = preprocessor.action_state_transform(batch)
+            return batch
+
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_episode, num) for num in range(episodes_num)]
+            for future in as_completed(futures):
+                try:
+                    batch = future.result()
+                    for meta in self.state_meta:
+                        key = meta['key']
+                        cur_state: torch.Tensor = batch['state'][key]
+                        state_min[key].append(cur_state.amin(0))
+                        state_max[key].append(cur_state.amax(0))
+                        state_mean[key].append(cur_state.mean(0))
+                        state_var[key].append(cur_state.var(0))
+                        state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
+                        state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
+                    for meta in self.action_meta:
+                        key = meta['key']
+                        cur_action: torch.Tensor = batch['action'][key]
+                        action_min[key].append(cur_action.amin(0))
+                        action_max[key].append(cur_action.amax(0))
+                        action_mean[key].append(cur_action.mean(0))
+                        action_var[key].append(cur_action.var(0))
+                        action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
+                        action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
+                except Exception as e:
+                    logger.error('Error processing episode: %s', e)
+                    print(traceback.format_exc())
+                    raise e
+
+        def get_mean_std(means, vars):
+            means = torch.stack(means)
+            vars = torch.stack(vars)
+            stepwise_mean = means.mean(0)
+            stepwise_std = (vars + (means - stepwise_mean) ** 2).mean(0).sqrt()
+            global_mean = means.mean((0, 1))
+            global_std = (vars + (means - global_mean) ** 2).mean((0, 1)).sqrt()
+            return stepwise_mean, stepwise_std, global_mean, global_std
+
+        stats = {
+            'state': DefaultDict(dict),
+            'action': DefaultDict(dict),
+            'num_episodes': episodes_num,
+            'num_transition': self.multi_dataset.num_frames,
+        }
+        for meta in self.state_meta:
+            key = meta['key']
+            stats['state'][key]['stepwise_min'] = torch.stack(state_min[key]).amin(0)
+            stats['state'][key]['stepwise_max'] = torch.stack(state_max[key]).amax(0)
+            stats['state'][key]['global_min'] = stats['state'][key]['stepwise_min'].amin(0)
+            stats['state'][key]['global_max'] = stats['state'][key]['stepwise_max'].amax(0)
+            stats['state'][key]['stepwise_q01'] = torch.stack(state_q01[key]).amin(0)
+            stats['state'][key]['stepwise_q99'] = torch.stack(state_q99[key]).amax(0)
+            stats['state'][key]['global_q01'] = stats['state'][key]['stepwise_q01'].amin(0)
+            stats['state'][key]['global_q99'] = stats['state'][key]['stepwise_q99'].amax(0)
+            (
+                stats['state'][key]['stepwise_mean'],
+                stats['state'][key]['stepwise_std'],
+                stats['state'][key]['global_mean'],
+                stats['state'][key]['global_std'],
+            ) = get_mean_std(state_mean[key], state_var[key])
+
+        for meta in self.action_meta:
+            key = meta['key']
+            stats['action'][key]['stepwise_min'] = torch.stack(action_min[key]).amin(0)
+            stats['action'][key]['stepwise_max'] = torch.stack(action_max[key]).amax(0)
+            stats['action'][key]['global_min'] = stats['action'][key]['stepwise_min'].amin(0)
+            stats['action'][key]['global_max'] = stats['action'][key]['stepwise_max'].amax(0)
+            stats['action'][key]['stepwise_q01'] = torch.stack(action_q01[key]).amin(0)
+            stats['action'][key]['stepwise_q99'] = torch.stack(action_q99[key]).amax(0)
+            stats['action'][key]['global_q01'] = stats['action'][key]['stepwise_q01'].amin(0)
+            stats['action'][key]['global_q99'] = stats['action'][key]['stepwise_q99'].amax(0)
+            (
+                stats['action'][key]['stepwise_mean'],
+                stats['action'][key]['stepwise_std'],
+                stats['action'][key]['global_mean'],
+                stats['action'][key]['global_std'],
+            ) = get_mean_std(action_mean[key], action_var[key])
+
+        return stats

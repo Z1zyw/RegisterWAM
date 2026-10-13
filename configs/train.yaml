@@ -1,0 +1,45 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: libero_plus
+  - model: register_wam_libero
+  - task: libero_plus
+
+output_dir: ./runs/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 2
+num_workers: 4
+prefetch_factor: 2
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+num_epochs: 1
+max_steps: null
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+max_grad_norm: 1.0
+seed: 42
+
+log_every: 10
+save_every: 1000
+eval_every: null
+eval_num_inference_steps: 10
+resume: null
+
+wandb:
+  enabled: false
+  project: register-wam
+  name: register-wam
+  mode: offline
+  workspace: null
+  group: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
